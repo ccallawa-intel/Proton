@@ -28,6 +28,7 @@ from ctypes import get_errno
 from ctypes import sizeof
 from ctypes import c_int
 from ctypes import c_int64
+from ctypes import c_uint16
 from ctypes import c_uint
 from ctypes import c_long
 from ctypes import c_char_p
@@ -457,6 +458,196 @@ class xess_version_t(Structure):
         ("reserved", c_uint16),
     ]
 
+def _bounds_check(buf, off, size):
+    return off >= 0 and size >= 0 and off + size <= len(buf)
+
+def _read_u16le(buf, off):
+    if not _bounds_check(buf, off, 2):
+        return None
+    return int.from_bytes(buf[off:off + 2], byteorder="little")
+
+def _read_u32le(buf, off):
+    if not _bounds_check(buf, off, 4):
+        return None
+    return int.from_bytes(buf[off:off + 4], byteorder="little")
+
+def _align_up4(value):
+    return (value + 3) & ~3
+
+def _extract_pe_file_version(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+
+    e_lfanew = _read_u32le(data, 0x3c)
+    if e_lfanew is None or not _bounds_check(data, e_lfanew, 0x18):
+        return None
+
+    if data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+        return None
+
+    file_header = e_lfanew + 4
+    number_of_sections = _read_u16le(data, file_header + 2)
+    size_of_optional_header = _read_u16le(data, file_header + 16)
+    if number_of_sections is None or size_of_optional_header is None:
+        return None
+
+    optional_header = file_header + 20
+    if not _bounds_check(data, optional_header, size_of_optional_header):
+        return None
+
+    magic = _read_u16le(data, optional_header)
+    if magic == 0x10b:
+        data_dir_off = optional_header + 96
+    elif magic == 0x20b:
+        data_dir_off = optional_header + 112
+    else:
+        return None
+
+    resource_dir_entry = data_dir_off + (2 * 8)
+    resource_rva = _read_u32le(data, resource_dir_entry)
+    resource_size = _read_u32le(data, resource_dir_entry + 4)
+    if resource_rva in (None, 0) or resource_size in (None, 0):
+        return None
+
+    section_table = optional_header + size_of_optional_header
+    if not _bounds_check(data, section_table, number_of_sections * 40):
+        return None
+
+    sections = []
+    for i in range(number_of_sections):
+        sec = section_table + i * 40
+        virtual_size = _read_u32le(data, sec + 8)
+        virtual_address = _read_u32le(data, sec + 12)
+        size_of_raw_data = _read_u32le(data, sec + 16)
+        pointer_to_raw_data = _read_u32le(data, sec + 20)
+
+        if None in (virtual_size, virtual_address, size_of_raw_data, pointer_to_raw_data):
+            continue
+
+        sections.append((virtual_address, max(virtual_size, size_of_raw_data), pointer_to_raw_data, size_of_raw_data))
+
+    def rva_to_offset(rva):
+        for virt_addr, virt_size, raw_ptr, raw_size in sections:
+            if virt_addr <= rva < virt_addr + virt_size:
+                rel = rva - virt_addr
+                if rel >= raw_size:
+                    return None
+                off = raw_ptr + rel
+                if _bounds_check(data, off, 1):
+                    return off
+        return None
+
+    resource_base = rva_to_offset(resource_rva)
+    if resource_base is None or not _bounds_check(data, resource_base, 16):
+        return None
+
+    def read_resource_directory(dir_off):
+        named = _read_u16le(data, dir_off + 12)
+        ident = _read_u16le(data, dir_off + 14)
+        if named is None or ident is None:
+            return []
+        entry_count = named + ident
+        entries_off = dir_off + 16
+        if not _bounds_check(data, entries_off, entry_count * 8):
+            return []
+        entries = []
+        for i in range(entry_count):
+            entry_off = entries_off + i * 8
+            name_or_id = _read_u32le(data, entry_off)
+            offset_to_data = _read_u32le(data, entry_off + 4)
+            if name_or_id is None or offset_to_data is None:
+                continue
+            entries.append((name_or_id, offset_to_data))
+        return entries
+
+    root_entries = read_resource_directory(resource_base)
+    rt_version_entry = None
+    for name_or_id, offset_to_data in root_entries:
+        is_name = (name_or_id & 0x80000000) != 0
+        if not is_name and (name_or_id & 0xffff) == 16:
+            rt_version_entry = offset_to_data
+            break
+
+    if rt_version_entry is None or (rt_version_entry & 0x80000000) == 0:
+        return None
+
+    lvl2_dir_off = resource_base + (rt_version_entry & 0x7fffffff)
+    lvl2_entries = read_resource_directory(lvl2_dir_off)
+    if not lvl2_entries:
+        return None
+
+    lvl2_target = lvl2_entries[0][1]
+    if (lvl2_target & 0x80000000) == 0:
+        return None
+
+    lvl3_dir_off = resource_base + (lvl2_target & 0x7fffffff)
+    lvl3_entries = read_resource_directory(lvl3_dir_off)
+    if not lvl3_entries:
+        return None
+
+    data_entry_ref = lvl3_entries[0][1]
+    if (data_entry_ref & 0x80000000) != 0:
+        return None
+
+    data_entry_off = resource_base + data_entry_ref
+    if not _bounds_check(data, data_entry_off, 16):
+        return None
+
+    version_data_rva = _read_u32le(data, data_entry_off)
+    version_data_size = _read_u32le(data, data_entry_off + 4)
+    if version_data_rva in (None, 0) or version_data_size in (None, 0):
+        return None
+
+    version_data_off = rva_to_offset(version_data_rva)
+    if version_data_off is None or not _bounds_check(data, version_data_off, version_data_size):
+        return None
+
+    w_length = _read_u16le(data, version_data_off)
+    w_value_length = _read_u16le(data, version_data_off + 2)
+    if w_length is None or w_value_length is None or w_length < 6:
+        return None
+
+    key_off = version_data_off + 6
+    key_end = key_off
+    while _bounds_check(data, key_end, 2):
+        if data[key_end:key_end + 2] == b"\x00\x00":
+            break
+        key_end += 2
+    else:
+        return None
+
+    try:
+        key = data[key_off:key_end].decode("utf-16le")
+    except UnicodeDecodeError:
+        return None
+
+    if key != "VS_VERSION_INFO":
+        return None
+
+    value_off = _align_up4(key_end + 2)
+    fixed_info_size = 13 * 4
+    if w_value_length < fixed_info_size or not _bounds_check(data, value_off, fixed_info_size):
+        return None
+
+    signature = _read_u32le(data, value_off)
+    if signature != 0xFEEF04BD:
+        return None
+
+    file_ver_ms = _read_u32le(data, value_off + 8)
+    file_ver_ls = _read_u32le(data, value_off + 12)
+    if file_ver_ms is None or file_ver_ls is None:
+        return None
+
+    return (
+        (file_ver_ms >> 16) & 0xffff,
+        file_ver_ms & 0xffff,
+        (file_ver_ls >> 16) & 0xffff,
+        file_ver_ls & 0xffff,
+    )
+
 def get_xess_vulkan_version(lib_name):
     try:
         lib = CDLL(lib_name)
@@ -475,6 +666,35 @@ def get_xess_vulkan_version(lib_name):
     result = xess_get_version(version)
     if result != 0:
         return None
+
+    return (version.major, version.minor, version.patch)
+
+def get_workload_xess_version(workload_dir):
+    if not workload_dir or not os.path.isdir(workload_dir):
+        return (None, None, False)
+
+    found_dll = False
+    versions = []
+
+    for root, _, files in os.walk(workload_dir):
+        for file_name in files:
+            if file_name.lower() != "libxess.dll":
+                continue
+
+            found_dll = True
+            dll_path = os.path.join(root, file_name)
+            file_version = _extract_pe_file_version(dll_path)
+            if file_version is not None:
+                versions.append((file_version[:3], dll_path))
+
+    if not found_dll:
+        return (None, None, False)
+
+    if not versions:
+        return (None, None, True)
+
+    selected = max(versions, key=lambda x: x[0])
+    return (selected[0], selected[1], True)
 
 EXT2_IOC_GETFLAGS = 0x80086601
 EXT2_IOC_SETFLAGS = 0x40086602
