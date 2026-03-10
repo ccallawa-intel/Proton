@@ -449,6 +449,33 @@ def can_import_shared_library(lib_name):
         return False
     return True
 
+class xess_version_t(Structure):
+    _fields_ = [
+        ("major", c_uint16),
+        ("minor", c_uint16),
+        ("patch", c_uint16),
+        ("reserved", c_uint16),
+    ]
+
+def get_xess_vulkan_version(lib_name):
+    try:
+        lib = CDLL(lib_name)
+    except OSError:
+        return None
+
+    try:
+        xess_get_version = lib.xessGetVersion
+    except AttributeError:
+        return None
+
+    xess_get_version.argtypes = [POINTER(xess_version_t)]
+    xess_get_version.restype = c_int
+
+    version = xess_version_t()
+    result = xess_get_version(version)
+    if result != 0:
+        return None
+
 EXT2_IOC_GETFLAGS = 0x80086601
 EXT2_IOC_SETFLAGS = 0x40086602
 
@@ -1604,6 +1631,68 @@ class Session:
         self.log_file = open(lfile_path, "a")
         return True
 
+    def do_xess_setup(self):
+        xess_vulkan_lib = None
+
+        if "XESS_VULKAN_LIB" in self.env:
+            xess_vulkan_lib = self.env["XESS_VULKAN_LIB"]
+
+            if file_exists(xess_vulkan_lib, follow_symlinks=True):
+                log("XeSS: using XESS_VULKAN_LIB from environment (" + xess_vulkan_lib + ")")
+            else:
+                log("WARNING: XESS_VULKAN_LIB environment variable is set to " + xess_vulkan_lib + " but that file does not exist; setting libxess=n")
+                xess_vulkan_lib = None
+                # set environment to safe default, overriding user settings if necessary.
+                self.env["PROTON_XESS_SHIM_ACTIVE"] = "0"
+                self.dlloverrides["libxess"] = "n"
+        elif can_import_shared_library("libxess_vulkan.so"):
+            self.env["XESS_VULKAN_LIB"] = "libxess_vulkan.so"
+            xess_vulkan_lib = "libxess_vulkan.so"
+            log("XeSS: found libxess_vulkan.so in standard library paths")
+        else:
+            self.dlloverrides["libxess"] = "n"
+            if "WINEDLLOVERRIDES" in self.env and "libxess" in self.env["WINEDLLOVERRIDES"]:
+                log("WARNING: overriding user WINEDLLOVERRIDES for libxess to disable it, as libxess_vulkan.so is not available")
+
+        # configure environment
+        if xess_vulkan_lib:
+            workload_dir = self.env.get("STEAM_COMPAT_INSTALL_PATH")
+            local_xess_version = get_xess_vulkan_version(xess_vulkan_lib)
+            log("XeSS: local libxess_vulkan.so version is " +
+                (f"{local_xess_version[0]}.{local_xess_version[1]}.{local_xess_version[2]}" if local_xess_version else "unknown"))
+            workload_xess_version, workload_xess_path, workload_has_xess = get_workload_xess_version(workload_dir)
+
+            if not workload_has_xess:
+                # activate shim just in case our workload XeSS logic is mistaken
+                log("XeSS: no bundled libxess.dll found in workload; using libxess_vulkan.so " +
+                    f"{local_xess_version[0]}.{local_xess_version[1]}.{local_xess_version[2]} with shim")
+                self.env["PROTON_XESS_SHIM_ACTIVE"] = "1"
+                self.dlloverrides["libxess"] = "y"
+            elif workload_xess_version is None:
+                log("XeSS: found bundled libxess.dll but could not determine its version; setting libxess=n")
+                self.env["PROTON_XESS_SHIM_ACTIVE"] = "0"
+                self.dlloverrides["libxess"] = "n"
+            elif local_xess_version is None:
+                log("XeSS: local libxess_vulkan.so version unavailable with bundled libxess.dll " +
+                    f"{workload_xess_version[0]}.{workload_xess_version[1]}.{workload_xess_version[2]}; setting libxess=n")
+                self.env["PROTON_XESS_SHIM_ACTIVE"] = "0"
+                self.dlloverrides["libxess"] = "n"
+            elif workload_xess_version > local_xess_version:
+                # bundled version is newer than local version, don't risk it
+                log("XeSS: bundled libxess.dll " +
+                    f"{workload_xess_version[0]}.{workload_xess_version[1]}.{workload_xess_version[2]} @ " +
+                    workload_xess_path + " is newer than local libxess_vulkan.so " +
+                    f"{local_xess_version[0]}.{local_xess_version[1]}.{local_xess_version[2]}; setting libxess=n")
+                self.env["PROTON_XESS_SHIM_ACTIVE"] = "0"
+                self.dlloverrides["libxess"] = "n"
+            else:
+                # bundled version is <= local version; okay to shim
+                log("XeSS: bundled libxess.dll " +
+                    f"{workload_xess_version[0]}.{workload_xess_version[1]}.{workload_xess_version[2]} <= " +
+                    f"local libxess_vulkan.so {local_xess_version[0]}.{local_xess_version[1]}.{local_xess_version[2]}; using shim")
+                self.env["PROTON_XESS_SHIM_ACTIVE"] = "1"
+                self.dlloverrides["libxess"] = "y"
+
     def init_session(self, update_prefix_files):
         self.env["WINEPREFIX"] = g_compatdata.prefix_dir
 
@@ -1918,16 +2007,7 @@ class Session:
         if "nativevulkanloader" in self.compat_config:
             self.dlloverrides["vulkan-1"] = "n"
 
-        if "XESS_VULKAN_LIB" in self.env:
-            log("XeSS: using XESS_VULKAN_LIB from environment (" + self.env["XESS_VULKAN_LIB"] + ")")
-        elif can_import_shared_library("libxess_vulkan.so"):
-            self.env["XESS_VULKAN_LIB"] = "libxess_vulkan.so"
-            log("XeSS: found libxess_vulkan.so in standard library paths")
-        elif "WINEDLLOVERRIDES" in self.env and "libxess" in self.env["WINEDLLOVERRIDES"]:
-            log("XeSS: libxess_vulkan.so unavailable; respecting user WINEDLLOVERRIDES for libxess")
-        else:
-            self.dlloverrides["libxess"] = "n"
-            log("XeSS: libxess_vulkan.so unavailable; setting libxess=n")
+        self.do_xess_setup()
 
         if "disablenvapi" not in self.compat_config or "forcenvapi" in self.compat_config:
             self.env["DXVK_ENABLE_NVAPI"] = "1"
