@@ -1996,14 +1996,14 @@ class Session:
 
         if "XESS_VULKAN_LIB" in self.env:
             log("XeSS: using XESS_VULKAN_LIB from environment (" + self.env["XESS_VULKAN_LIB"] + ")")
-        elif can_import_shared_library("libxess_vulkan.so"):
-            self.env["XESS_VULKAN_LIB"] = "libxess_vulkan.so"
-            log("XeSS: found libxess_vulkan.so in standard library paths")
+        elif can_import_shared_library("libxess.so"):
+            self.env["XESS_VULKAN_LIB"] = "libxess.so"
+            log("XeSS: found libxess.so in standard library paths")
         elif "WINEDLLOVERRIDES" in self.env and "libxess" in self.env["WINEDLLOVERRIDES"]:
-            log("XeSS: libxess_vulkan.so unavailable; respecting user WINEDLLOVERRIDES for libxess")
+            log("XeSS: libxess.so unavailable; respecting user WINEDLLOVERRIDES for libxess")
         else:
             self.dlloverrides["libxess"] = "n"
-            log("XeSS: libxess_vulkan.so unavailable; setting libxess=n")
+            log("XeSS: libxess.so unavailable; setting libxess=n")
 
         if "disablenvapi" not in self.compat_config or "forcenvapi" in self.compat_config:
             self.env["DXVK_ENABLE_NVAPI"] = "1"
