@@ -1135,6 +1135,7 @@ class CompatData:
                         prefix=self.prefix_dir, track_file=tracked_files, link_debug=True,
                         optional=True) # redist versions may not have the contrib dir
 
+
                 if use_wined3d:
                     dxvkfiles = []
                     vkd3d_protonfiles = []
@@ -1996,6 +1997,9 @@ class Session:
 
         if "XESS_VULKAN_LIB" in self.env:
             log("XeSS: using XESS_VULKAN_LIB from environment (" + self.env["XESS_VULKAN_LIB"] + ")")
+        elif file_exists(g_proton.contrib_dir + "libxess.so", follow_symlinks=True):
+            self.env["XESS_VULKAN_LIB"] = g_proton.contrib_dir + "libxess.so"
+            log("XeSS: found libxess.so in contrib at " + self.env["XESS_VULKAN_LIB"])
         elif can_import_shared_library("libxess.so"):
             self.env["XESS_VULKAN_LIB"] = "libxess.so"
             log("XeSS: found libxess.so in standard library paths")
