@@ -1995,13 +1995,13 @@ class Session:
         if "nativevulkanloader" in self.compat_config:
             self.dlloverrides["vulkan-1"] = "n"
 
-        if "XESS_VULKAN_LIB" in self.env:
-            log("XeSS: using XESS_VULKAN_LIB from environment (" + self.env["XESS_VULKAN_LIB"] + ")")
+        if "XESS_LIB_OVERRIDE" in self.env:
+            log("XeSS: using XESS_LIB_OVERRIDE from environment (" + self.env["XESS_LIB_OVERRIDE"] + ")")
         elif file_exists(g_proton.contrib_dir + "libxess.so", follow_symlinks=True):
-            self.env["XESS_VULKAN_LIB"] = g_proton.contrib_dir + "libxess.so"
-            log("XeSS: found libxess.so in contrib at " + self.env["XESS_VULKAN_LIB"])
+            self.env["XESS_LIB_OVERRIDE"] = g_proton.contrib_dir + "libxess.so"
+            log("XeSS: found libxess.so in contrib at " + self.env["XESS_LIB_OVERRIDE"])
         elif can_import_shared_library("libxess.so"):
-            self.env["XESS_VULKAN_LIB"] = "libxess.so"
+            self.env["XESS_LIB_OVERRIDE"] = "libxess.so"
             log("XeSS: found libxess.so in standard library paths")
         elif "WINEDLLOVERRIDES" in self.env and "libxess" in self.env["WINEDLLOVERRIDES"]:
             log("XeSS: libxess.so unavailable; respecting user WINEDLLOVERRIDES for libxess")
