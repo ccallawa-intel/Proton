@@ -504,7 +504,7 @@ def find_game_xess_dll():
     return None
 
 def is_xess_compatible(so_path):
-    """Return True if the libxess.so version is <= the game-shipped libxess.dll version."""
+    """Return True if the libxess.so version is >= the game-shipped libxess.dll version."""
     so_ver = get_xess_so_version(so_path)
     if so_ver is None:
         log("XeSS: could not determine version of " + so_path)
