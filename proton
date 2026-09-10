@@ -271,18 +271,6 @@ def getmtimestr(*path_fragments):
     except IOError:
         return "0"
 
-def get_validated_steamapps_parent(orig_path):
-    try:
-        path = os.path.realpath(orig_path)
-        if os.path.isdir(path) and os.path.basename(path) == "steamapps":
-            parent = os.path.dirname(path)
-            if os.access(parent, os.W_OK) and os.stat(path).st_dev == os.stat(parent).st_dev:
-                return parent
-    except: pass
-
-    log("Error: unable to use parent for game drive, path " + orig_path)
-    return orig_path
-
 def try_get_game_library_dir():
     if "STEAM_COMPAT_INSTALL_PATH" not in g_session.env or \
             "STEAM_COMPAT_LIBRARY_PATHS" not in g_session.env:
@@ -292,7 +280,7 @@ def try_get_game_library_dir():
     library_paths = g_session.env["STEAM_COMPAT_LIBRARY_PATHS"].split(":")
     for path in library_paths:
         if path in g_session.env["STEAM_COMPAT_INSTALL_PATH"]:
-            return get_validated_steamapps_parent(path)
+            return path
 
     return None
 
@@ -455,6 +443,88 @@ def find_nvidia_wine_dll_dir():
         return nvidia_wine_dir
 
     return None
+
+def can_import_shared_library(lib_name):
+    try:
+        CDLL(lib_name)
+    except OSError:
+        return False
+    return True
+
+def get_xess_so_version(path):
+    """Return (major, minor, patch) from a libxess.so, or None on failure."""
+    try:
+        from ctypes import byref, c_uint16
+        lib = CDLL(path)
+        class xess_version_t(Structure):
+            _fields_ = [
+                ("major", c_uint16),
+                ("minor", c_uint16),
+                ("patch", c_uint16),
+                ("reserved", c_uint16),
+            ]
+        get_ver = lib.xessGetVersion
+        get_ver.restype = c_int
+        get_ver.argtypes = [POINTER(xess_version_t)]
+        ver = xess_version_t()
+        if get_ver(byref(ver)) == 0:  # XESS_RESULT_SUCCESS
+            return (ver.major, ver.minor, ver.patch)
+    except (OSError, AttributeError):
+        pass
+    return None
+
+def get_pe_file_version(path):
+    """Return (major, minor, patch) from a PE binary's version resource, or None on failure."""
+    import struct
+    # VS_FIXEDFILEINFO is identified by the signature 0xFEEF04BD (little-endian)
+    VS_FFI_SIGNATURE = b'\xbd\x04\xef\xfe'
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        idx = data.find(VS_FFI_SIGNATURE)
+        if idx < 0:
+            return None
+        _sig, _struc_ver, file_ver_ms, file_ver_ls = struct.unpack_from('<IIII', data, idx)
+        major = (file_ver_ms >> 16) & 0xffff
+        minor = file_ver_ms & 0xffff
+        patch = (file_ver_ls >> 16) & 0xffff
+        return (major, minor, patch)
+    except (OSError, struct.error):
+        return None
+
+def find_game_xess_dll():
+    """Walk the game install directory to locate a game-shipped libxess.dll."""
+    install_path = g_session.env.get("STEAM_COMPAT_INSTALL_PATH")
+    if not install_path:
+        return None
+    for root, _dirs, files in os.walk(install_path):
+        for name in files:
+            if name.lower() == "libxess.dll":
+                return os.path.join(root, name)
+    return None
+
+def is_xess_compatible(so_path):
+    """Return True if libxess.so major/minor is >= game libxess.dll major/minor."""
+    so_ver = get_xess_so_version(so_path)
+    if so_ver is None:
+        log("XeSS: could not determine version of " + so_path)
+        return False
+
+    game_dll_path = find_game_xess_dll()
+    if game_dll_path is None:
+        log("XeSS: could not find game-shipped libxess.dll")
+        return False
+
+    game_dll_ver = get_pe_file_version(game_dll_path)
+    if game_dll_ver is None:
+        log("XeSS: could not read version from " + game_dll_path)
+        return False
+
+    log("XeSS: libxess.so version {}, game libxess.dll version {} (comparing major.minor only)".format(
+        ".".join(str(v) for v in so_ver),
+        ".".join(str(v) for v in game_dll_ver)))
+
+    return so_ver[:2] >= game_dll_ver[:2]
 
 EXT2_IOC_GETFLAGS = 0x80086601
 EXT2_IOC_SETFLAGS = 0x40086602
@@ -993,7 +1063,7 @@ class CompatData:
                 os.symlink("/", self.prefix_dir + "/dosdevices/z:")
 
             # collect configuration info
-            steam_linux_path = os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]
+            steamdir = os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]
 
             use_wined3d = "wined3d" in g_session.compat_config
             use_dxvk_dxgi = not use_wined3d and \
@@ -1051,10 +1121,10 @@ class CompatData:
                 CURRENT_PREFIX_VERSION,
                 g_proton.fonts_dir,
                 g_proton.lib_dir,
-                steam_linux_path,
-                getmtimestr(steam_linux_path, 'legacycompat', 'steamclient.dll'),
-                getmtimestr(steam_linux_path, 'legacycompat', 'steamclient64.dll'),
-                getmtimestr(steam_linux_path, 'legacycompat', 'Steam.dll'),
+                steamdir,
+                getmtimestr(steamdir, 'legacycompat', 'steamclient.dll'),
+                getmtimestr(steamdir, 'legacycompat', 'steamclient64.dll'),
+                getmtimestr(steamdir, 'legacycompat', 'Steam.dll'),
                 g_proton.default_pfx_dir,
                 getmtimestr(g_proton.default_pfx_dir, 'system.reg'),
                 str(use_wined3d),
@@ -1086,17 +1156,17 @@ class CompatData:
 
             with open(self.tracked_files_file, "a") as tracked_files:
                 #copy steam files into place
-                steam_in_pfx_dir = "drive_c/Program Files (x86)/Steam/"
-                makedirs(self.prefix_dir + steam_in_pfx_dir)
+                steam_dir = "drive_c/Program Files (x86)/Steam/"
+                makedirs(self.prefix_dir + steam_dir)
                 filestocopy = [("steamclient.dll", "steamclient.dll"),
                                ("steamclient64.dll", "steamclient64.dll"),
                                ("GameOverlayRenderer64.dll", "GameOverlayRenderer64.dll"),
                                ("SteamService.exe", "steam.exe"),
                                ("Steam.dll", "Steam.dll")]
                 for (src,tgt) in filestocopy:
-                    srcfile = steam_linux_path + '/legacycompat/' + src
+                    srcfile = steamdir + '/legacycompat/' + src
                     if os.path.isfile(srcfile):
-                        try_copy(srcfile, steam_in_pfx_dir + tgt, prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                        try_copy(srcfile, steam_dir + tgt, prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
 
                 filestocopy = [("steamclient64.dll", "steamclient64.dll"),
                                ("GameOverlayRenderer.dll", "GameOverlayRenderer.dll"),
@@ -1104,16 +1174,12 @@ class CompatData:
                 for (src,tgt) in filestocopy:
                     srcfile = g_proton.path(src)
                     if os.path.isfile(srcfile):
-                        try_copy(srcfile, steam_in_pfx_dir + tgt, prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
-
-                try:
-                    self.create_symlink(self.prefix_dir + steam_in_pfx_dir + 'appcache', steam_linux_path + '/appcache')
-                except: pass
+                        try_copy(srcfile, steam_dir + tgt, prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
 
                 # CW Bug 19152. IL-2 Sturmovik: Cliffs of Dover Blitz Edition needs user's localconfig.vdf
                 if os.environ.get("SteamGameId", 0) == "754530":
-                    srcdir = os.path.join(steam_linux_path, 'userdata')
-                    dstdir = os.path.join(self.prefix_dir, steam_in_pfx_dir, 'userdata')
+                    srcdir = os.path.join(steamdir, 'userdata')
+                    dstdir = os.path.join(self.prefix_dir, steam_dir, 'userdata')
                     # figuring out the current user is hard, so copy the config for all users
                     for userid in os.listdir(srcdir):
                         srcvdf = os.path.join(srcdir, userid, 'config', 'localconfig.vdf')
@@ -1143,6 +1209,7 @@ class CompatData:
                 try_copy(g_proton.contrib_dir + "amdxcffx64.dll", "drive_c/windows/system32",
                         prefix=self.prefix_dir, track_file=tracked_files, link_debug=True,
                         optional=True) # redist versions may not have the contrib dir
+
 
                 if use_wined3d:
                     dxvkfiles = []
@@ -1235,21 +1302,12 @@ class CompatData:
                                  track_file=tracked_files,
                                  link_debug=True)
 
-                intc_store = "drive_c/windows/system32/DriverStore/FileRepository/igd_faux.inf_1"
-                makedirs(os.path.join(self.prefix_dir, intc_store))
-                try_copy(g_proton.arch_pe_dir("wine/igdext", False) + "igdext64.dll",
-                         intc_store,
-                         optional=True,
-                         prefix=self.prefix_dir,
-                         track_file=tracked_files,
-                         link_debug=True)
-
             setup_game_dir_drive()
             setup_steam_dir_drive()
             setup_openvr_paths()
 
             # add Steam ffmpeg libraries to path
-            prepend_to_env_str(g_session.env, ld_path_var, steam_linux_path + "/ubuntu12_64/video/:" + steam_linux_path + "/ubuntu12_32/video/:" + steam_linux_path + "/steamrtarm64/video/", ":")
+            prepend_to_env_str(g_session.env, ld_path_var, steamdir + "/ubuntu12_64/video/:" + steamdir + "/ubuntu12_32/video/:" + steamdir + "/steamrtarm64/video/", ":")
 
 def comma_escaped(s):
     escaped = False
@@ -1479,23 +1537,6 @@ default_cpu_limit = {
     "1038250"   :  "P",   # DIRT 5
 }
 
-fex_application_profiles = {
-    "292030" : { # The Witcher 3: Wild Hunt
-        "setup*": {
-            "X87ReducedPrecision": "0"
-        }
-    }
-}
-
-def get_current_cpu_affinity():
-    try:
-        affinity = os.sched_getaffinity(0)
-        if len(affinity) >= os.cpu_count():
-            return ""
-        topo_str = ",".join(map(str, list(affinity)))
-        return f"{len(affinity)}:{topo_str}"
-    except: return ""
-
 class Session:
     def __init__(self):
         self.log_file = None
@@ -1542,11 +1583,6 @@ class Session:
             self.env["WINE_CPU_TOPOLOGY"] = self.env["PROTON_CPU_TOPOLOGY"]
         elif appid in default_cpu_limit:
             self.env["WINE_CPU_TOPOLOGY"] = default_cpu_limit[appid]
-        elif "WINE_CPU_TOPOLOGY" not in self.env and platform.machine() == 'aarch64':
-            topo_str = get_current_cpu_affinity()
-            if topo_str != "":
-                self.env["WINE_CPU_TOPOLOGY"] = topo_str
-
 
         if "WINE_HIDE_AMD_GPU" not in self.env and appid in [
                     "1282690",
@@ -1572,14 +1608,8 @@ class Session:
         if "SteamVirtualGamepadInfo_Proton" in self.env and "SteamVirtualGamepadInfo" not in self.env:
             self.env["SteamVirtualGamepadInfo"] = self.env["SteamVirtualGamepadInfo_Proton"]
 
-        if "PROTON_USE_WOW64" not in self.env and "SteamGameId" in self.env:
-            if self.env["SteamGameId"] in [
-                    "747920",
-                    ]:
-                self.env["PROTON_USE_WOW64"] = "1"
-
         self.env.pop("WINEARCH", "")
-        if "PROTON_USE_WOW64" in self.env and self.env["PROTON_USE_WOW64"] == "1" and platform.machine() == "x86_64":
+        if os.environ.get("PROTON_USE_WOW64", None) == "1" and platform.machine() == "x86_64":
             self.env["WINEARCH"] = "wow64"
 
         if 'ORIG_'+ld_path_var not in os.environ:
@@ -1712,12 +1742,6 @@ class Session:
         if "PROTON_LOG" in self.env:
             app_config["Config"]["SilentLog"] = "0" if self.log_enabled_for("fex", True) else "1"
 
-        if "SteamGameId" in os.environ and os.environ["SteamGameId"] in fex_application_profiles:
-            try:
-                app_config["AppOverrides"] = fex_application_profiles[os.environ["SteamGameId"]]
-            except (KeyError, ValueError):
-                pass
-
         return app_config
 
     def init_session(self, update_prefix_files):
@@ -1763,6 +1787,7 @@ class Session:
         self.check_environment("PROTON_DXVK_D3D8", "dxvkd3d8")
         self.check_environment("PROTON_NO_D3D11", "nod3d11")
         self.check_environment("PROTON_NO_D3D10", "nod3d10")
+        self.check_environment("PROTON_NO_ESYNC", "noesync")
         self.check_environment("PROTON_NO_FSYNC", "nofsync")
         self.check_environment("PROTON_FORCE_LARGE_ADDRESS_AWARE", "forcelgadd")
         self.check_environment("PROTON_OLD_GL_STRING", "oldglstr")
@@ -1777,6 +1802,11 @@ class Session:
         self.check_environment("PROTON_DISABLE_NVAPI", "disablenvapi")
         self.check_environment("PROTON_FORCE_NVAPI", "forcenvapi")
         self.check_environment("PROTON_HIDE_APU", "hideapu")
+
+        if "noesync" in self.compat_config:
+            self.env.pop("WINEESYNC", "")
+        else:
+            self.env["WINEESYNC"] = "1"
 
         if "nofsync" in self.compat_config:
             self.env.pop("WINEFSYNC", "")
@@ -1881,17 +1911,8 @@ class Session:
                     "374320", #DARK SOULS III
                     "357190", #Ultimate Marvel vs Capcom 3
                     "730830", #Escape from Monkey Island
-                    "229480", #Dungeons & Dragons: Chronicles of Mystara
                     ]:
                 self.env["PROTON_LIMIT_RESOLUTIONS"] = "32"
-
-        if "PROTON_SPOOF_STEAMINPUT_VIDPID" not in self.env:
-            if os.environ.get("SteamGameId", 0) in [
-                    "939960", #Far Cry New Dawn
-                    "250900", #The Binding of Isaac: Rebirth
-                    "297860", #Split/Second
-                    ]:
-                self.env["PROTON_SPOOF_STEAMINPUT_VIDPID"] = "1"
 
         if "forcelgadd" in self.compat_config:
             self.env["WINE_LARGE_ADDRESS_AWARE"] = "1"
@@ -2048,6 +2069,38 @@ class Session:
 
         if "nativevulkanloader" in self.compat_config:
             self.dlloverrides["vulkan-1"] = "n"
+
+        if "XESS_LIB_OVERRIDE" in self.env:
+            override_path = self.env["XESS_LIB_OVERRIDE"]
+            if os.path.exists(override_path):
+                if os.path.isfile(override_path):
+                    log("XeSS: using XESS_LIB_OVERRIDE from environment (" + override_path + ")")
+                else:
+                    raise RuntimeError("XeSS: XESS_LIB_OVERRIDE from environment is not a valid file: " + override_path)
+            else:
+                raise RuntimeError("XeSS: XESS_LIB_OVERRIDE from environment does not exist: " + override_path)
+        elif file_exists(g_proton.contrib_dir + "libxess.so", follow_symlinks=True):
+            potential_override = g_proton.contrib_dir + "libxess.so"
+            log("XeSS: found libxess.so in contrib at " + potential_override)
+            if is_xess_compatible(potential_override):
+                log("XeSS: using libxess.so from contrib")
+                self.env["XESS_LIB_OVERRIDE"] = potential_override
+            else:
+                log("XeSS: libxess.so from contrib is not compatible; ignoring")
+                self.dlloverrides["libxess"] = "n"
+        elif can_import_shared_library("libxess.so"):
+            log("XeSS: found libxess.so in standard library paths")
+            if is_xess_compatible("libxess.so"):
+                log("XeSS: using libxess.so from standard library paths")
+                self.env["XESS_LIB_OVERRIDE"] = "libxess.so"
+            else:
+                log("XeSS: libxess.so from standard library paths is not compatible; ignoring")
+                self.dlloverrides["libxess"] = "n"
+        elif "WINEDLLOVERRIDES" in self.env and "libxess" in self.env["WINEDLLOVERRIDES"]:
+            log("XeSS: libxess.so unavailable; respecting user WINEDLLOVERRIDES for libxess")
+        else:
+            self.dlloverrides["libxess"] = "n"
+            log("XeSS: libxess.so unavailable; setting libxess=n")
 
         if "disablenvapi" not in self.compat_config or "forcenvapi" in self.compat_config:
             self.env["DXVK_ENABLE_NVAPI"] = "1"
